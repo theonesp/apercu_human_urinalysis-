@@ -1,0 +1,70 @@
+---
+title: "Apercu: 11_dataset_creation_and_exploration Nitrates"
+author: Miguel Ángel Armengol de la Hoz
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output:
+  html_notebook:
+    code_folding: hide
+    number_sections: yes
+    theme: flatly
+    toc: yes
+    toc_float: yes
+
+knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, encoding = encoding, output_file = paste0(substr(inputFile,1,nchar(inputFile)-4)," ",Sys.Date(),'.html')) })
+---
+
+# Environment
+
+```{r message=FALSE, warning=FALSE}
+library(dplyr)
+library(ggplot2)
+library(data.table)
+library(stringr)
+library(reshape2)
+library(sqldf)
+library(readr)
+library(plotly)
+library(stringr)
+library(caret)
+library(magrittr)
+```
+
+# Creating 50 A
+
+```{r}
+appended_series_set150A_selected<-appended_series_set1_selected[,c(1:3)]
+```
+
+
+## Train and test datasets creation
+
+### Spliting de-identified data into testing and training, balanced version.
+
+We want the data to be sampled randomly but always the same way and we want to be sure that train and test datasets are balanced.
+
+```{r}
+# Creating id for partition 
+appended_series_set150A_selected['id']<- seq.int(nrow(appended_series_set150A_selected))
+## set the seed to make our partition reproducible
+set.seed(123)
+# createDataPartition: "the random sampling is done within the levels of y when y is a factor in an attempt to balance the class distributions within the splits."
+## 75% of the sample size
+train_idx <- createDataPartition(as.factor(appended_series_set150A_selected$bact), times = 1, p = 0.75, list=F)
+train_set150A <- appended_series_set150A_selected[train_idx, ]
+test_set150A  <- appended_series_set150A_selected[-train_idx, ]
+#Checking outcome is actually balanced
+round(prop.table(table(appended_series_set150A_selected$bact)),2)
+round(prop.table(table(appended_series_set150A_selected$bact)),2)
+```
+
+### Separating datasets into outcome and exposures
+
+```{r}
+# train dataset
+train_X_set150A<-train_set150A[, names(train_set150A)!= "bact"]
+train_Y_set150A<-train_set150A$bact
+  
+# test dataset
+test_X_set150A<-test_set150A[, names(test_set150A)!= "bact"]
+test_Y_set150A<-test_set150A$bact 
+```

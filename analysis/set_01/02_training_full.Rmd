@@ -1,0 +1,452 @@
+---
+title: "Apercu: 02_train_set1ing_model"
+author: Miguel Ángel Armengol de la Hoz
+date: '`r format(Sys.Date(), "%B %d, %Y")`'
+output:
+  html_notebook:
+    code_folding: hide
+    number_sections: yes
+    theme: flatly
+    toc: yes
+    toc_float: yes
+
+knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, encoding = encoding, output_file = paste0(substr(inputFile,1,nchar(inputFile)-4)," ",Sys.Date(),'.html')) })
+---
+
+# Environment
+
+```{r }
+library(tidyverse)
+library(dplyr)
+require(foreign)
+require(Hmisc)
+require(reshape2)
+require(caret)
+require(boot)
+require(pROC)
+library(mlbench)
+library(MLmetrics)
+library(gbm)
+library(xgboost)
+library(oddsratio)
+library(hmeasure)
+library(ROCR)
+```
+
+# Random Hyperparameter Tunning
+
+The default method for optimizing tuning parameters in train_set1 is to use a grid search. This approach is usually effective but, in cases when there are many tuning parameters, it can be inefficient. An alternative is to use a combination of grid search and racing. Another is to use a random selection of tuning parameter combinations to cover the parameter space to a lesser extent.
+
+Using [caret](https://topepo.github.io/caret/).
+
+_We can adress later the tuning parameters approach_
+
+```{r}
+set.seed(123)
+fitControl <- trainControl(method = "repeatedcv",
+                           number = 10,
+                           repeats = 3,
+                           classProbs = TRUE,
+                           summaryFunction = twoClassSummary,
+                           verboseIter = T,
+                           search = "random")
+```
+
+## Random selection of tuning parameter combinations
+
+Here we are first adressing several Machine Learning methods.
+There are more methods that can be addressed [Available Models in caret::train_set1](https://rdrr.io/cran/caret/man/models.html)
+
+```{r eval=FALSE, include=FALSE}
+# defining outcome, exposures
+
+outcome_model <- 'bact'
+exposures_model <- names(train_set1)[grepl("spectrum", names(train_set1))]
+
+
+outcome_and_exposure <- as.formula(
+  paste( paste(outcome_model ,'~'
+        , paste(exposures_model, collapse = " + ") )
+  )
+)
+
+# Machine learning methods
+# gbmFit_set1 <- train( outcome_and_exposure
+#                 ,data = train_set1,
+#                 method = "gbm",
+#                 trControl = fitControl,
+#                 verbose = T,
+#                 metric = "ROC", ## Specify which metric to optimize
+#                 task_type = "GPU"
+# )
+svmFit_set1 <- train( outcome_and_exposure
+                ,data = train_set1,
+                method = "svmRadial",
+                trControl = fitControl,
+                preProc = c("center", "scale"),
+                tuneLength = 8,
+                metric = "ROC", ## Specify which metric to optimize
+                task_type = "GPU"
+)
+rfFit_set1 <- train( outcome_and_exposure
+                ,data = train_set1,
+                method = "rf",
+                trControl = fitControl,
+                verbose = T,
+                metric = "ROC" , ## Specify which metric to optimize
+                task_type = "GPU"
+)
+xgbFit_set1 <- train( outcome_and_exposure
+                ,data = train_set1,
+                method = "xgbTree",
+                trControl = fitControl,
+                verbose = T,
+                metric = "ROC" , ## Specify which metric to optimize
+                task_type = "GPU"
+)
+
+lrFit_set1 <- train( outcome_and_exposure
+                ,data = train_set1,
+                method = "LogitBoost",
+                trControl = fitControl,
+                verbose = T,
+                metric = "ROC" , ## Specify which metric to optimize
+                task_type = "GPU"
+)
+
+```
+
+## Best models comprarision
+
+```{r}
+resamps <- resamples(list( #gbmFit = gbmFit_set1
+                          svmFit = svmFit_set1
+                          ,rfFit  = rfFit_set1
+                          ,xgbFit = xgbFit_set1
+                          #,nnFit = nnFit   # nn failed so we are not test_set1ing it
+                          ,lrFit = lrFit_set1
+                          #,gamFit = gamFit
+                          ))
+summary_resamps<-summary(resamps)
+summary_resamps<-as.data.frame(summary_resamps$statistics)
+summary_resamps
+```
+
+
+# Selecting the model with the best performance
+
+```{r}
+# we save the best performing model (based on its ROC) and its name
+best_performing_model<-get(
+  rownames(summary_resamps[which(summary_resamps$ROC.Median==max(summary_resamps$ROC.Median))]
+)
+)
+#manually select it
+best_performing_model<-rfFit_set1
+best_performing_model_name<-best_performing_model$method # extracts name as string from model
+```
+
+We can see **`r best_performing_model_name`** is the model with the best performance, with a Median AUROC of **`r max(summary_resamps$ROC.Median)`**.  
+
+Its best Random Hyperparameter Tune was:  
+`r best_performing_model$bestTune`
+
+# Evaluating the predictor on our test_set1 dataset
+
+## Creating prediction-probabilities dataset
+
+```{r}
+prediction_probabilities<-predict(rfFit_set1, newdata = test_set1,type = "prob") # We create the probabilities dataset using our best performing model.
+final_predictions<-cbind(test_Y_set1,prediction_probabilities) # we bind our prediction with the actual data
+final_predictions<-rename(final_predictions, obs = test_Y_set1) # the function twoClassSummary reads the actual outcome as 'obs'
+# NEEDS TO BE CHANGED FOR EVERY MODEL DEPENDING ON THE OUTCOME!!!
+final_predictions['pred']<-ifelse(final_predictions$Pos > .83 # we have set the threshold in .5 this can be optimized until best performance is achieved
+                                  ,'Pos','Neg'
+)
+# Setting proper data types
+final_predictions$obs<-as.factor(final_predictions$obs)
+final_predictions$pred<-as.factor(final_predictions$pred)
+```
+
+## Geting evaluation insights
+
+```{r fig.height=13, fig.width=13}
+obs.labels.01 <- relabel(final_predictions$obs)
+pred.labels.01 <- relabel(final_predictions$pred)
+insights_list<-HMeasure(obs.labels.01,pred.labels.01)
+
+insights_metrics<-round(as.data.frame(insights_list$metrics),3)
+
+# we have so many different metrics, let's select only some of them
+insights_metrics<-insights_metrics%>%select(AUC, Sens,Spec, Precision,F)
+#renaming metric
+insights_metrics<-insights_metrics%>%rename(AUROC = AUC) 
+
+# we transpose the data for its representation
+insights_metrics<-as.data.frame(t(insights_metrics))
+names(insights_metrics)<-'Percent'
+
+insights_metrics$Percent<-insights_metrics$Percent*100
+
+insights_metrics['Category']<-rownames(insights_metrics)
+# how to order the bars
+insights_metrics$Category <- factor(insights_metrics$Category
+                     , levels = insights_metrics$Category)
+
+best_performing_model_name
+
+len <- 4
+df2 <- data.frame(Category = letters[1:len], Percent = rep(0, len), 
+                                 Category2 = rep("", len))
+insights_metrics$Category2 <- 
+ paste0(insights_metrics$Category,": ",insights_metrics$Percent,"%")
+
+# append number to category name
+insights_metrics <- rbind(insights_metrics, df2)
+
+# set factor so it will plot in descending order 
+insights_metrics$Category <-
+    factor(insights_metrics$Category, 
+    levels=rev(insights_metrics$Category))
+
+
+ggplot(insights_metrics, aes(x = Category, y = Percent
+    ,fill = Category 
+    ))+ 
+    geom_bar(width = 0.9, stat="identity") + 
+    coord_polar(theta = "y") +
+    xlab("") + ylab("") +
+    ylim(c(0,100)) +
+    #ggtitle(paste(best_performing_model_name,"Performing Metrics")) +
+    geom_text(data = insights_metrics, hjust = 1, size = 6,
+              aes(x = Category, y = 0, label = Category2)) +
+    theme_minimal() +
+    theme(legend.position = "none",
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          axis.line = element_blank(),
+          axis.text.y = element_blank(),
+          axis.text.x = element_blank(),
+          axis.ticks = element_blank())+
+  scale_fill_manual(
+ values=c("#e57373", "#9fa8da","#81d4fa","#80cbc4","#ffab91","#fff176","#80cbc4","#81d4fa","#e57373")
+,name='', labels=c("AUROC", "Sensitivity","Specificity", "F"))
+
+```
+
+# Several AUROC curves
+
+## Creating plot dataset
+
+### svm
+
+```{r}
+prediction_probabilities_svm<-predict(svmFit_set1, newdata = test_set1, type = "prob") # We create the probabilities dataset using our best performing model.
+final_predictions_svm<-cbind(test_Y_set1, prediction_probabilities_svm) # we bind our prediction with the actual data
+final_predictions_svm<-rename(final_predictions_svm, obs = test_Y_set1) # the function twoClassSummary reads the actual outcome as 'obs'
+# NEEDS TO BE CHANGED FOR EVERY MODEL DEPENDING ON THE OUTCOME!!!
+final_predictions_svm['pred']<-ifelse(final_predictions_svm$Pos > .83 # we have set the threshold in .5 this can be optimized until best performance is achieved
+                                  ,'Pos','Neg'
+)
+# Setting proper data types
+final_predictions_svm$obs<-as.factor(final_predictions_svm$obs)
+final_predictions_svm$pred<-as.factor(final_predictions_svm$pred)
+```
+
+### gbm
+
+```{r}
+prediction_probabilities_gbm<-predict(gbmFit_set1, newdata = test_set1, type = "prob") # We create the probabilities dataset using our best performing model.
+final_predictions_gbm<-cbind(test_Y_set1, prediction_probabilities_gbm) # we bind our prediction with the actual data
+final_predictions_gbm<-rename(final_predictions_gbm, obs = test_Y_set1) # the function twoClassSummary reads the actual outcome as 'obs'
+# NEEDS TO BE CHANGED FOR EVERY MODEL DEPENDING ON THE OUTCOME!!!
+final_predictions_gbm['pred']<-ifelse(final_predictions_gbm$Pos > .83 # we have set the threshold in .5 this can be optimized until best performance is achieved
+                                  ,'Pos','Neg'
+)
+# Setting proper data types
+final_predictions_gbm$obs<-as.factor(final_predictions_gbm$obs)
+final_predictions_gbm$pred<-as.factor(final_predictions_gbm$pred)
+```
+
+### rf
+
+```{r}
+prediction_probabilities_rf<-predict(rfFit_set1, newdata = test_set1, type = "prob") # We create the probabilities dataset using our best performing model.
+final_predictions_rf<-cbind(test_Y_set1, prediction_probabilities_rf) # we bind our prediction with the actual data
+final_predictions_rf<-rename(final_predictions_rf, obs = test_Y_set1) # the function twoClassSummary reads the actual outcome as 'obs'
+# NEEDS TO BE CHANGED FOR EVERY MODEL DEPENDING ON THE OUTCOME!!!
+final_predictions_rf['pred']<-ifelse(final_predictions_rf$Pos > .83 # we have set the threshold in .5 this can be optimized until best performance is achieved
+                                  ,'Pos','Neg'
+)
+# Setting proper data types
+final_predictions_rf$obs<-as.factor(final_predictions_rf$obs)
+final_predictions_rf$pred<-as.factor(final_predictions_rf$pred)
+```
+
+### xgb
+
+```{r}
+prediction_probabilities_xgb<-predict(xgbFit_set1, newdata = test_set1, type = "prob") # We create the probabilities dataset using our best performing model.
+final_predictions_xgb<-cbind(test_Y_set1, prediction_probabilities_xgb) # we bind our prediction with the actual data
+final_predictions_xgb<-rename(final_predictions_xgb, obs = test_Y_set1) # the function twoClassSummary reads the actual outcome as 'obs'
+# NEEDS TO BE CHANGED FOR EVERY MODEL DEPENDING ON THE OUTCOME!!!
+final_predictions_xgb['pred']<-ifelse(final_predictions_xgb$Pos > .83 # we have set the threshold in .5 this can be optimized until best performance is achieved
+                                  ,'Pos','Neg'
+)
+# Setting proper data types
+final_predictions_xgb$obs<-as.factor(final_predictions_xgb$obs)
+final_predictions_xgb$pred<-as.factor(final_predictions_xgb$pred)
+```
+
+### lr
+
+```{r}
+prediction_probabilities_lr<-predict(lrFit_set1, newdata = test_set1, type = "prob") # We create the probabilities dataset using our best performing model.
+final_predictions_lr<-cbind(test_Y_set1, prediction_probabilities_lr) # we bind our prediction with the actual data
+final_predictions_lr<-rename(final_predictions_lr, obs = test_Y_set1) # the function twoClassSummary reads the actual outcome as 'obs'
+# NEEDS TO BE CHANGED FOR EVERY MODEL DEPENDING ON THE OUTCOME!!!
+final_predictions_lr['pred']<-ifelse(final_predictions_lr$Pos > .83 # we have set the threshold in .5 this can be optimized until best performance is achieved
+                                  ,'Pos','Neg'
+)
+# Setting proper data types
+final_predictions_lr$obs<-as.factor(final_predictions_lr$obs)
+final_predictions_lr$pred<-as.factor(final_predictions_lr$pred)
+```
+
+## ROC Plots
+
+```{r}
+#AUC per method
+auc_svm<-auc(roc(relabel(test_Y_set1),relabel(final_predictions_svm$pred) ))
+auc_gbm<-auc(roc(relabel(test_Y_set1),relabel(final_predictions_gbm$pred) ))
+auc_rf<-auc(roc(relabel(test_Y_set1),relabel(final_predictions_rf$pred) ))
+auc_xgb<-auc(roc(relabel(test_Y_set1),relabel(final_predictions_xgb$pred) ))
+auc_lr<-auc(roc(relabel(test_Y_set1),relabel(final_predictions_lr$pred) ))
+
+
+
+# svm AUROC data
+df_svm <- cbind(list(1- final_predictions_svm$Neg), list(as.numeric(final_predictions_svm$obs) - 1))
+pred_svm <- prediction(df_svm[1], df_svm[2])
+perf_svm <- performance(pred_svm,"tpr","fpr")
+
+# gbm AUROC data
+df_gbm <- cbind(list(1- final_predictions_gbm$Neg), list(as.numeric(final_predictions_gbm$obs) - 1))
+pred_gbm <- prediction(df_gbm[1], df_gbm[2])
+perf_gbm <- performance(pred_gbm,"tpr","fpr")
+
+# rf AUROC data
+df_rf <- cbind(list(1- final_predictions_rf$Neg), list(as.numeric(final_predictions_rf$obs) - 1))
+pred_rf <- prediction(df_rf[1], df_rf[2])
+perf_rf <- performance(pred_rf,"tpr","fpr")
+
+# xgb AUROC data
+df_xgb <- cbind(list(1- final_predictions_xgb$Neg), list(as.numeric(final_predictions_xgb$obs) - 1))
+pred_xgb <- prediction(df_xgb[1], df_xgb[2])
+perf_xgb <- performance(pred_xgb,"tpr","fpr")
+
+# lr AUROC data
+df_lr <- cbind(list(1- final_predictions_lr$Neg), list(as.numeric(final_predictions_lr$obs) - 1))
+pred_lr <- prediction(df_lr[1], df_lr[2])
+perf_lr <- performance(pred_lr,"tpr","fpr")
+
+
+all_rocs<-cbind(x=perf_svm@x.values[[1]],y=perf_svm@y.values[[1]],method='SVM',auc=auc_svm)
+all_rocs<-rbind(all_rocs, 
+                cbind(x=perf_gbm@x.values[[1]],y=perf_gbm@y.values[[1]],method='GBM',auc=auc_gbm
+                )
+)
+all_rocs<-rbind(all_rocs, 
+                cbind(x=perf_rf@x.values[[1]],y=perf_rf@y.values[[1]],method='RF',auc=auc_rf
+                )
+)
+all_rocs<-rbind(all_rocs, 
+                cbind(x=perf_xgb@x.values[[1]],y=perf_xgb@y.values[[1]],method='XGB',auc=auc_xgb
+                )
+)
+all_rocs<-rbind(all_rocs, 
+                cbind(x=perf_lr@x.values[[1]],y=perf_lr@y.values[[1]],method='LR',auc=auc_lr
+                )
+)
+
+
+# assigning proper type to each column so ggplot process them properly
+all_rocs<-as.data.frame(all_rocs)
+all_rocs$x<-as.numeric(all_rocs$x)
+all_rocs$y<-as.numeric(all_rocs$y)
+all_rocs$auc<-round(as.numeric(all_rocs$auc),2)
+  
+
+```
+
+```{r fig.height=5, fig.width=5}
+tiff("test.tiff", units="in", width=5, height=5, res=300)
+ggplot2::ggplot(data=all_rocs ,aes(x=x, y=y, colour=paste0(method,': ',auc))) +
+ggplot2::geom_line()+
+  theme_classic()+
+  labs(colour="Method AUROC")+
+  xlab('1 - Specificity')+
+  ylab('Sensitivity')+
+  geom_abline(intercept = 0.00, slope = 1,linetype='dashed')+
+  theme(legend.position = c(0.8, 0.2))
+dev.off()
+```
+
+
+
+
+
+# Variables Importance
+
+```{r fig.height=39, fig.width=4, message=TRUE, warning=TRUE}
+ggplot(varImp(rfFit_set1, scale = T))+theme_minimal() 
+dataset_1_varImp<-varImp(rfFit_set1, scale = T)
+dataset_1_varImp<-as.data.frame(dataset_1_varImp[["importance"]])
+dataset_1_varImp$datapoint<-rownames(dataset_1_varImp)
+dataset_1_varImp_top_5<-dataset_1_varImp%>%top_n(n=5,wt=Overall)
+
+write.xlsx(dataset_1_varImp_top_5,'nitrates_varImp_top_5.xlsx',row.names = F)
+```
+
+# Explaining the model
+
+```{r}
+dataset_1_varImp_top_5$datapoint<-paste0(dataset_1_varImp_top_5$datapoint,' + 740')
+dataset_1_varImp_top_5$datapoint_num <- as.numeric(sub('^[^_]*_(\\d+).*', '\\1', dataset_1_varImp_top_5$datapoint))
+```
+
+### Plotting Important variables
+
+```{r }
+# getting the aggregated dataset ready
+datasetforplot_principal_analysis<-appended_series_wide[6:336]
+datasetforplot_principal_analysis<-datasetforplot_principal_analysis
+
+datasetforplot_principal_analysis<-apply( datasetforplot_principal_analysis,2, median )
+datasetforplot_principal_analysis<-as.data.frame(datasetforplot_principal_analysis)
+
+
+xmax<-nrow(datasetforplot_principal_analysis)-1
+datasetforplot_principal_analysis$x<-c(0:xmax)
+
+datasetforplot_principal_analysis<-rename(datasetforplot_principal_analysis, y = datasetforplot_principal_analysis)
+
+# crating dataset with annotation
+notes<-data.frame(position=c(dataset_1_varImp_top_5$datapoint_num),
+                      text=c(as.character(dataset_1_varImp_top_5$datapoint_num))
+)
+
+ggplot(data = datasetforplot_principal_analysis, mapping = aes(x = x, y = y)) +
+  geom_line()+
+  xlim(175, 250)+
+  xlab('Spectrum')+
+  ylab('Absorbance')+
+  ggtitle("Bacteria Nitrates Prediction Datapoints")+
+  geom_vline(data=notes, mapping=aes(xintercept=position), color="grey44",linetype="dotted") +
+  geom_text(data=notes, mapping=aes(x=position, y=0, label=text), size=3, angle=90, vjust=-0.4, hjust=0)+
+  theme_minimal()
+
+
+
+```
+
